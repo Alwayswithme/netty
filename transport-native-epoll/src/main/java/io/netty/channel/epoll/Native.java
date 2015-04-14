@@ -177,6 +177,26 @@ final class Native {
 
     private static native int close0(int fd);
 
+    public static int splice(int fd, int offIn, int fdOut, int offOut, int len) throws IOException {
+        int res =  splice0(fd, offIn, fdOut, offOut, len);
+        if (res >= 0) {
+            return res;
+        }
+        throw newIOException("splice", res);
+    }
+
+    private static native int splice0(int fd, int offIn, int fdOut, int offOut, int len);
+
+    public static long pipe() throws IOException {
+        long res = pipe0();
+        if (res >= 0) {
+            return res;
+        }
+        throw newIOException("pipe", (int) res);
+    }
+
+    private static native long pipe0();
+
     public static int write(int fd, ByteBuffer buf, int pos, int limit) throws IOException {
         int res = write0(fd, buf, pos, limit);
         if (res >= 0) {

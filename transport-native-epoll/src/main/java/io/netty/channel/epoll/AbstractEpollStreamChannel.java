@@ -28,17 +28,24 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.DefaultFileRegion;
+import io.netty.channel.EventLoop;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.unix.FileDescriptor;
+import io.netty.util.internal.EmptyArrays;
+import io.netty.util.internal.MpscLinkedQueueNode;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 
 import java.io.IOException;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.util.Queue;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
 
@@ -46,8 +53,20 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
             " (expected: " + StringUtil.simpleClassName(ByteBuf.class) + ", " +
                     StringUtil.simpleClassName(DefaultFileRegion.class) + ')';
 
+    static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = new ClosedChannelException();
+
+    static {
+        CLOSED_CHANNEL_EXCEPTION.setStackTrace(EmptyArrays.EMPTY_STACK_TRACE);
+    }
+
+    private final Queue<SpliceInTask> spliceQueue = PlatformDependent.newMpscQueue();
+
     private volatile boolean inputShutdown;
     private volatile boolean outputShutdown;
+
+    // Lazy init these if we need to splice(...)
+    private int pipeIn = -1;
+    private int pipeOut = -1;
 
     protected AbstractEpollStreamChannel(Channel parent, int fd) {
         super(parent, fd, Native.EPOLLIN, true);
@@ -68,6 +87,41 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
     @Override
     protected AbstractEpollUnsafe newUnsafe() {
         return new EpollStreamUnsafe();
+    }
+
+    /**
+     * @see {@link #spliceTo(AbstractEpollStreamChannel, int, ChannelPromise)}
+     */
+    public final ChannelFuture spliceTo(final AbstractEpollStreamChannel ch, final int len) {
+        return spliceTo(ch, len, newPromise());
+    }
+
+    /**
+     * Splice from this {@link AbstractEpollStreamChannel} to another {@link AbstractEpollStreamChannel}.
+     *
+     * Please note that both channels need to be registered to the same {@link EventLoop}, otherwise an
+     * {@link IllegalArgumentException} is thrown.
+     */
+    public final ChannelFuture spliceTo(final AbstractEpollStreamChannel ch, final int len,
+                                        final ChannelPromise promise) {
+        if (ch.eventLoop() != eventLoop()) {
+            throw new IllegalArgumentException("EventLoops are not the same");
+        }
+        if (len < 0) {
+            throw new IllegalArgumentException("len must be >= 0 but was " + len);
+        }
+        if (!isOpen()) {
+            promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+        } else {
+            SpliceInTask task = new SpliceInTask(ch, len, checkNotNull(promise, "promise"));
+            spliceQueue.add(task);
+            if (!isOpen()) {
+                // Seems like the Channel was closed in the meantime try to fail the promise to prevent any
+                // cases where a future may not be notified otherwise.
+                promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+            }
+        }
+        return promise;
     }
 
     /**
@@ -274,6 +328,11 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 // the network stack can handle more writes.
                 return false;
             }
+        } else if (msg instanceof SpliceOutTask) {
+            if (!((SpliceOutTask) msg).spliceOut()) {
+                return false;
+            }
+            in.remove();
         } else {
             // Should never reach here.
             throw new Error();
@@ -342,6 +401,9 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
         if (msg instanceof DefaultFileRegion) {
             return msg;
         }
+        if (msg instanceof SpliceOutTask) {
+            return msg;
+        }
 
         throw new UnsupportedOperationException(
                 "unsupported message type: " + StringUtil.simpleClassName(msg) + EXPECTED_TYPES);
@@ -362,6 +424,27 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
             promise.setSuccess();
         } catch (Throwable cause) {
             promise.setFailure(cause);
+        }
+    }
+
+    @Override
+    protected void doClose() throws Exception {
+        try {
+            super.doClose();
+            if (pipeIn != -1) {
+                Native.close(pipeIn);
+                Native.close(pipeOut);
+                pipeIn = -1;
+                pipeOut = -1;
+            }
+        } finally {
+            for (;;) {
+                SpliceInTask task = spliceQueue.poll();
+                if (task == null) {
+                    break;
+                }
+                task.promise.tryFailure(CLOSED_CHANNEL_EXCEPTION);
+            }
         }
     }
 
@@ -603,6 +686,20 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 int messages = 0;
                 int totalReadAmount = 0;
                 do {
+                    SpliceInTask spliceTask = spliceQueue.peek();
+                    if (spliceTask != null) {
+                        if (spliceTask.spliceIn()) {
+                            // We need to check if it is still active as if not we removed all SpliceTasks in
+                            // doClose(...)
+                            if (isActive()) {
+                                spliceQueue.remove();
+                            }
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+
                     // we use a direct buffer here as the native implementations only be able
                     // to handle direct buffers.
                     byteBuf = allocHandle.allocate(allocator);
@@ -669,6 +766,120 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 if (!readPending && !config.isAutoRead()) {
                     clearEpollIn0();
                 }
+            }
+        }
+    }
+
+    private void createPipe() throws IOException {
+        long fds = Native.pipe();
+        pipeIn = (int) (fds >> 32);
+        pipeOut = (int) fds;
+    }
+
+    private final class SpliceInTask extends MpscLinkedQueueNode<SpliceInTask> {
+        private final AbstractEpollStreamChannel ch;
+        private final ChannelPromise promise;
+        private final ChannelFutureListener listener = new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture future) throws Exception {
+                if (!future.isSuccess()) {
+                    promise.setFailure(future.cause());
+                }
+            }
+        };
+        private int len;
+
+        SpliceInTask(AbstractEpollStreamChannel ch, int len, ChannelPromise promise) {
+            this.ch = ch;
+            this.len = len;
+            this.promise = promise;
+        }
+
+        @Override
+        public SpliceInTask value() {
+            return this;
+        }
+
+        public boolean spliceIn() throws IOException {
+            assert ch.eventLoop().inEventLoop();
+
+            if (len == 0) {
+                promise.setSuccess();
+                return true;
+            }
+            if (promise.isDone()) {
+                return true;
+            }
+
+            try {
+                // We create the pipe on the target channel as this will allow us to just handle pending writes
+                // later in a correct fashion without get into any ordering issues when spliceTo(...) is called
+                // on multiple Channels pointing to one target Channel.
+                int pipeIn = ch.pipeIn;
+                if (pipeIn == -1) {
+                    // Create a new pipe as non was created before.
+                    ch.createPipe();
+                }
+                int splicedIn = Native.splice(fd().intValue(), -1, ch.pipeOut, -1, len);
+
+                ChannelPromise splicePromise;
+                if (len != Integer.MAX_VALUE) {
+                    len -= splicedIn;
+                }
+                if (len == 0) {
+                    splicePromise = promise;
+                } else {
+                    splicePromise = ch.newPromise().addListener(listener);
+                }
+
+                boolean autoRead = config().isAutoRead();
+
+                // Just call unsafe().write(...) and flush() as we not want to traverse the whole pipeline for this
+                // case.
+                ch.unsafe().write(new SpliceOutTask(ch, splicedIn, autoRead), splicePromise);
+                ch.unsafe().flush();
+                if (autoRead && !splicePromise.isDone()) {
+                    // write was not done which means the target channel was not writable. In this case we need to
+                    // disable reading until we are done with splicing to the target channel.
+                }
+            } catch (Throwable cause) {
+                promise.setFailure(cause);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    private final class SpliceOutTask {
+        private final AbstractEpollStreamChannel ch;
+        private final boolean autoRead;
+        private int len;
+
+        SpliceOutTask(AbstractEpollStreamChannel ch, int len, boolean autoRead) {
+            this.ch = ch;
+            this.len = len;
+            this.autoRead = autoRead;
+        }
+
+        public boolean spliceOut() throws Exception {
+            assert ch.eventLoop().inEventLoop();
+            try {
+                int splicedOut = Native.splice(ch.pipeIn, -1, ch.fd().intValue(), -1, len);
+                len -= splicedOut;
+                if (len == 0) {
+                    if (autoRead) {
+                        // AutoRead was used and we spliced everything so start reading again
+                        config().setAutoRead(true);
+                    }
+                    return true;
+                }
+                return false;
+            } catch (IOException e) {
+                if (autoRead) {
+                    // AutoRead was used and we spliced everything so start reading again
+                    config().setAutoRead(true);
+                }
+                throw e;
             }
         }
     }

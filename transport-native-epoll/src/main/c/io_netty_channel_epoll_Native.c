@@ -1583,7 +1583,7 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_offsetofEpollData(JNIE
 JNIEXPORT jlong JNICALL Java_io_netty_channel_epoll_Native_pipe0(JNIEnv* env, jclass clazz) {
     int fd[2];
     if (pipe2) {
-        // we can just use pipe2 and so safe extra syscalls;
+        // we can just use pipe2 and so save extra syscalls;
         if (pipe2(fd, O_NONBLOCK) != 0) {
             return -errno;
         }

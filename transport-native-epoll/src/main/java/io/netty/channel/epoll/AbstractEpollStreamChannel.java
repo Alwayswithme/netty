@@ -841,6 +841,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 if (autoRead && !splicePromise.isDone()) {
                     // write was not done which means the target channel was not writable. In this case we need to
                     // disable reading until we are done with splicing to the target channel.
+                    config().setAutoRead(false);
                 }
             } catch (Throwable cause) {
                 promise.setFailure(cause);
